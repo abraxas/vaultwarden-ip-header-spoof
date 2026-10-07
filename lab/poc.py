@@ -233,40 +233,82 @@ import urllib.error
 import urllib.parse
 import urllib.request
 import uuid
+from collections.abc import Callable
+from dataclasses import dataclass
+from pathlib import Path
+from typing import NoReturn
 
 WITNESS = "VAULTWARDEN-IP-HEADER-SPOOF-WITNESS"
 LABEL = "VAULTWARDEN-IP-HEADER-SPOOF"
-VW = os.environ.get("VW_URL", "http://127.0.0.1:18170").rstrip("/")
-VW_NONE = os.environ.get("VW_NONE_URL", "http://127.0.0.1:18171").rstrip("/")
-COMPOSE = os.environ.get("COMPOSE_PROJECT_NAME", "vaultwarden-ip-header-spoof")
-HERE = os.path.dirname(os.path.abspath(__file__))
+DEFAULT_VW_URL = "http://127.0.0.1:18170"
+DEFAULT_VW_NONE_URL = "http://127.0.0.1:18171"
+DEFAULT_COMPOSE_PROJECT = "vaultwarden-ip-header-spoof"
 EMAIL = "user@lab.invalid"
+REGISTER_NAME = "lab"
+MASTER_PASSWORD_HASH = "dGVzdGhhc2g="
+KDF_TYPE = 0
+KDF_ITERATIONS = 600000
 BURST = 14
+HTTP_TIMEOUT_S = 20
+LOG_TAIL = 80
+LOG_TIMEOUT_S = 30
+SANITIZE_MAX = 240
+LOG_SNIPPET_MAX = 400
+LOG_HIT_KEEP = 6
 DUMMY_KEY = "0.dGVzdA=="
 LONG_KEY = (
     "0.dGVzdGhhc2h0ZXN0aGFzaHRlc3Q=|"
     "dGVzdGhhc2h0ZXN0aGFzaHRlc3RoYXNodGVzdA==|"
     "dGVzdGhhc2h0ZXN0aGFzaHRlc3RoYXNodGVzdGhhc2g="
 )
+PATH_REGISTER = "/identity/accounts/register"
+PATH_TOKEN = "/identity/connect/token"
+VW_SERVICE = "vw"
+REGISTER_OK = (200, 201)
+REGISTER_EXISTS = (400, 409, 422)
+REGISTER_RETRY = (400, 422)
+SPOOF_PREFIX = "198.51.100."
+NONE_SPOOF_PREFIX = "203.0.113."
+LOG_TOKENS = ("IP:", "X-Real-IP", "trusted", "Ignoring", "login request")
+JsonBody = dict[str, str | int]
+HeaderFn = Callable[[int], dict[str, str]]
+
+
+@dataclass(frozen=True)
+class LabConfig:
+    vw_url: str
+    vw_none_url: str
+    compose_project: str
+    here: Path
+
+    @classmethod
+    def from_env(cls) -> LabConfig:
+        return cls(
+            vw_url=os.environ.get("VW_URL", DEFAULT_VW_URL).rstrip("/"),
+            vw_none_url=os.environ.get("VW_NONE_URL", DEFAULT_VW_NONE_URL).rstrip("/"),
+            compose_project=os.environ.get(
+                "COMPOSE_PROJECT_NAME", DEFAULT_COMPOSE_PROJECT
+            ),
+            here=Path(__file__).resolve().parent,
+        )
 
 
 def log(msg: str) -> None:
     print(msg, flush=True)
 
 
-def fail(reason: str) -> None:
+def fail(reason: str) -> NoReturn:
     log(f"FAIL {LABEL} {reason}")
     raise SystemExit(1)
 
 
-def success(detail: str) -> None:
+def success(detail: str) -> int:
     log(f"SUCCESS {LABEL} {detail} {WITNESS}")
-    raise SystemExit(0)
+    return 0
 
 
 def sanitize(text: str) -> str:
-    out = text.replace("\n", " ").replace("\r", " ")
-    return out[:240]
+    return text.replace("\n", " ").replace("\r", " ")[:SANITIZE_MAX]
 
 
 def http(
@@ -274,13 +316,13 @@ def http(
     method: str = "GET",
     headers: dict[str, str] | None = None,
     form: dict[str, str] | None = None,
-    json_body: dict | None = None,
-    timeout: int = 20,
+    json_body: JsonBody | None = None,
+    timeout: int = HTTP_TIMEOUT_S,
 ) -> tuple[int, str]:
     hdrs = {"Accept": "application/json"}
     if headers:
         hdrs.update(headers)
-    data = None
+    data: bytes | None = None
     if json_body is not None:
         data = json.dumps(json_body).encode("utf-8")
         hdrs["Content-Type"] = "application/json"
@@ -295,39 +337,42 @@ def http(
     except urllib.error.HTTPError as exc:
         body = exc.read().decode("utf-8", "replace")
         return int(exc.code), body
-    except Exception as exc:
+    except (urllib.error.URLError, TimeoutError, OSError) as exc:
         return 0, sanitize(str(exc))
 
 
-def register_body(key: str) -> dict:
+def register_body(key: str) -> JsonBody:
     return {
         "email": EMAIL,
-        "name": "lab",
-        "masterPasswordHash": "dGVzdGhhc2g=",
+        "name": REGISTER_NAME,
+        "masterPasswordHash": MASTER_PASSWORD_HASH,
         "key": key,
-        "kdf": 0,
-        "kdfIterations": 600000,
+        "kdf": KDF_TYPE,
+        "kdfIterations": KDF_ITERATIONS,
     }
 
 
 def register(base: str) -> None:
-    url = f"{base}/identity/accounts/register"
+    url = f"{base}{PATH_REGISTER}"
     status, body = http(url, method="POST", json_body=register_body(DUMMY_KEY))
-    if status in (200, 201):
+    if status in REGISTER_OK:
         log(f"IOC register-ok host={base} status={status}")
         return
-    if status in (400, 409, 422) and "already exists" in body.lower():
+    if status in REGISTER_EXISTS and "already exists" in body.lower():
         log(f"IOC register-exists host={base} status={status}")
         return
-    if status in (400, 422):
+    if status in REGISTER_RETRY:
         status2, body2 = http(url, method="POST", json_body=register_body(LONG_KEY))
-        if status2 in (200, 201):
+        if status2 in REGISTER_OK:
             log(f"IOC register-ok-longkey host={base} status={status2}")
             return
-        if status2 in (400, 409, 422) and "already exists" in body2.lower():
+        if status2 in REGISTER_EXISTS and "already exists" in body2.lower():
             log(f"IOC register-exists host={base} status={status2}")
             return
-        fail(f"register failed host=loopback status={status}/{status2} body={sanitize(body2 or body)}")
+        fail(
+            f"register failed host=loopback status={status}/{status2} "
+            f"body={sanitize(body2 or body)}"
+        )
     fail(f"register failed host=loopback status={status} body={sanitize(body)}")
 
 
@@ -346,7 +391,7 @@ def login_form() -> dict[str, str]:
 
 def login(base: str, extra_headers: dict[str, str] | None = None) -> int:
     status, _body = http(
-        f"{base}/identity/connect/token",
+        f"{base}{PATH_TOKEN}",
         method="POST",
         form=login_form(),
         headers=extra_headers,
@@ -354,32 +399,48 @@ def login(base: str, extra_headers: dict[str, str] | None = None) -> int:
     return status
 
 
-def dump_vw_logs() -> str:
+def dump_vw_logs(cfg: LabConfig) -> str:
     try:
         proc = subprocess.run(
-            ["docker", "compose", "-p", COMPOSE, "logs", "--no-color", "--tail", "80", "vw"],
-            cwd=HERE,
+            [
+                "docker",
+                "compose",
+                "-p",
+                cfg.compose_project,
+                "logs",
+                "--no-color",
+                "--tail",
+                str(LOG_TAIL),
+                VW_SERVICE,
+            ],
+            cwd=cfg.here,
             capture_output=True,
             text=True,
-            timeout=30,
+            timeout=LOG_TIMEOUT_S,
             check=False,
         )
-    except Exception:
+    except (OSError, subprocess.TimeoutExpired):
         return "no-logs"
-    hits = []
+    hits: list[str] = []
     for line in (proc.stdout or "").splitlines():
-        if any(tok in line for tok in ("IP:", "X-Real-IP", "trusted", "Ignoring", "login request")):
+        if any(tok in line for tok in LOG_TOKENS):
             hits.append(sanitize(line))
     if not hits:
         return "no-ip-lines"
-    return " | ".join(hits[-6:])[:400]
+    return " | ".join(hits[-LOG_HIT_KEEP:])[:LOG_SNIPPET_MAX]
 
 
-def burst_until_429(base: str, extra_headers_fn=None) -> tuple[int, int]:
+def x_real_ip(prefix: str, octet: int) -> dict[str, str]:
+    return {"X-Real-IP": f"{prefix}{octet}"}
+
+
+def burst_until_429(
+    base: str, extra_headers_fn: HeaderFn | None = None
+) -> tuple[int, int]:
     first_429 = 0
     last_status = 0
     for i in range(1, BURST + 1):
-        headers = extra_headers_fn(i) if extra_headers_fn else None
+        headers = extra_headers_fn(i) if extra_headers_fn is not None else None
         last_status = login(base, headers)
         if last_status == 429 and first_429 == 0:
             first_429 = i
@@ -387,21 +448,24 @@ def burst_until_429(base: str, extra_headers_fn=None) -> tuple[int, int]:
     return first_429, last_status
 
 
-def main() -> None:
-    register(VW)
-    register(VW_NONE)
+def main() -> int:
+    cfg = LabConfig.from_env()
+    register(cfg.vw_url)
+    register(cfg.vw_none_url)
 
-    nohdr_429_at, nohdr_last = burst_until_429(VW)
+    nohdr_429_at, nohdr_last = burst_until_429(cfg.vw_url)
     log(f"IOC nohdr-429-at={nohdr_429_at} nohdr-last-status={nohdr_last}")
     if nohdr_429_at == 0:
-        fail(f"no 429 without header last-status={nohdr_last} logs={dump_vw_logs()}")
+        fail(
+            f"no 429 without header last-status={nohdr_last} logs={dump_vw_logs(cfg)}"
+        )
 
     spoof_400 = 0
     spoof_429 = 0
     spoof_other = 0
     spoof_last = 0
     for n in range(1, BURST + 1):
-        spoof_last = login(VW, {"X-Real-IP": f"198.51.100.{n}"})
+        spoof_last = login(cfg.vw_url, x_real_ip(SPOOF_PREFIX, n))
         if spoof_last == 400:
             spoof_400 += 1
         elif spoof_last == 429:
@@ -412,7 +476,7 @@ def main() -> None:
     if spoof_429 != 0:
         fail(
             f"spoofed X-Real-IP still 429 spoof-400={spoof_400} spoof-429={spoof_429} "
-            f"spoof-other={spoof_other} last={spoof_last} logs={dump_vw_logs()}"
+            f"spoof-other={spoof_other} last={spoof_last} logs={dump_vw_logs(cfg)}"
         )
     if spoof_400 != BURST or spoof_other != 0:
         fail(
@@ -421,18 +485,24 @@ def main() -> None:
         )
 
     def none_headers(n: int) -> dict[str, str]:
-        return {"X-Real-IP": f"203.0.113.{n}"}
+        return x_real_ip(NONE_SPOOF_PREFIX, n)
 
-    none_429_at, none_last = burst_until_429(VW_NONE, none_headers)
+    none_429_at, none_last = burst_until_429(cfg.vw_none_url, none_headers)
     log(f"IOC none-429-at={none_429_at} none-last-status={none_last}")
     if none_429_at == 0:
         fail(f"IP_HEADER=none never 429 last-status={none_last}")
 
-    success(
-        f"nohdr-429-at={nohdr_429_at} spoof-400={spoof_400} spoof-429={spoof_429} none-429-at={none_429_at}"
+    return success(
+        f"nohdr-429-at={nohdr_429_at} spoof-400={spoof_400} spoof-429={spoof_429} "
+        f"none-429-at={none_429_at}"
     )
 
 
 if __name__ == "__main__":
-    main()
+    try:
+        raise SystemExit(main())
+    except SystemExit:
+        raise
+    except Exception as exc:
+        fail(f"exception {type(exc).__name__}: {exc}")
 

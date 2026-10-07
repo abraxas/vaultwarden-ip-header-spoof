@@ -226,17 +226,22 @@ _builtins.print = _cprint
 
 """Vaultwarden 1.37.3 default X-Real-IP trusted-local bypasses login IP governor. Loopback lab client."""
 
-import os
 import subprocess
 import sys
+from pathlib import Path
 
-HERE = os.path.dirname(os.path.abspath(__file__))
-LAB = os.path.join(HERE, "lab")
+HERE = Path(__file__).resolve().parent
+LAB = HERE / "lab"
+RUN_SH = LAB / "run.sh"
 
 
 def main() -> int:
-    os.chdir(LAB)
-    return subprocess.call(["bash", os.path.join(LAB, "run.sh"), *sys.argv[1:]])
+    completed = subprocess.run(
+        ["bash", str(RUN_SH), *sys.argv[1:]],
+        cwd=LAB,
+        check=False,
+    )
+    return int(completed.returncode)
 
 
 if __name__ == "__main__":
