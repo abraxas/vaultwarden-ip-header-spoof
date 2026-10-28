@@ -13,6 +13,10 @@
   &nbsp;·&nbsp;
   <a href="https://github.com/abraxas/vaultwarden-ip-header-spoof">vaultwarden-ip-header-spoof</a>
 </p>
+<p align="center">
+  Write-up: <a href="https://abraxaslabs.tech/research/vaultwarden-ip-header-spoof"><strong>https://abraxaslabs.tech/research/vaultwarden-ip-header-spoof</strong></a>
+</p>
+
 
 # vaultwarden-ip-header-spoof
 
